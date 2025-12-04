@@ -60,6 +60,32 @@ class TaskState(BaseModel):
 
 tasks: Dict[str, TaskState] = {}
 progress_subs: Dict[str, List[asyncio.Queue]] = defaultdict(list)
+# Very small in-memory project/shot store to satisfy spec endpoints
+projects: Dict[str, Dict] = {}
+project_shots: Dict[str, Dict[str, Dict]] = defaultdict(dict)
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def _make_shot(project_id: str, order: int, shot_id: Optional[str] = None, title: str = "", prompt: str = "", transition: str = "") -> Dict:
+    shot_id = shot_id or str(uuid.uuid4())
+    now = _now_iso()
+    return {
+        "id": shot_id,
+        "projectId": project_id,
+        "order": order,
+        "title": title or f"Shot {order}",
+        "description": "",
+        "prompt": prompt or "",
+        "status": "created",
+        "imagePath": "",
+        "audioPath": "",
+        "transition": transition or "",
+        "createdAt": now,
+        "updatedAt": now,
+    }
 
 
 class RenderRequest(BaseModel):
@@ -144,7 +170,7 @@ class TTSParam(BaseModel):
     voice: Optional[str] = None
     lang: Optional[str] = None
     sample_rate: Optional[int] = None
-    format: Optional[str] = None
+    format: Optional[str] = Field("wav", description="audio format")  # spec requires format
 
 
 class GenerateParameters(BaseModel):
@@ -595,6 +621,7 @@ async def generate_vi(req: GeneratePayload, background_tasks: BackgroundTasks):
             "story": story,
             "style": style,
             "scenes": scenes,
+            "prompt_text": prompt_text,
             "speaker": tts.voice,
             "speed": 1.0,
         },
@@ -616,6 +643,14 @@ async def task_stream(task_id: str):
         raise HTTPException(status_code=404, detail="task not found")
     return StreamingResponse(_task_event_stream(task_id), media_type="text/event-stream")
 
+# Spec-compatible task query
+@app.get("/v1/api/tasks/{task_id}")
+async def task_status_v1(task_id: str):
+    state = tasks.get(task_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="task not found")
+    return {"task": _as_task_schema(state)}
+
 
 @app.get("/v1/api/jobs/{job_id}", response_model=TaskSchema)
 async def job_status(job_id: str):
@@ -630,9 +665,175 @@ async def stop_job(job_id: str):
     state = tasks.get(job_id)
     if not state:
         raise HTTPException(status_code=404, detail="task not found")
-    now = datetime.utcnow().isoformat()
+    now = _now_iso()
     _update_task(job_id, status=TASK_STATUS_CANCELLED, message="stopped by user", finishedAt=now)
-    return {}
+    return {"success": True, "deleteAT": now, "error": ""}
+
+
+# ---- Project & shot endpoints (spec stubs) ----
+def _get_or_404_project(project_id: str) -> Dict:
+    project = projects.get(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+    return project
+
+
+def _recent_task_for_project(project_id: str) -> Dict:
+    for t in tasks.values():
+        if t.project_id == project_id:
+            ts = _as_task_schema(t).dict()
+            ts.setdefault("parameters", {})
+            ts.setdefault("result", {})
+            ts.setdefault("error", "")
+            ts.setdefault("estimatedDuration", 0)
+            ts.setdefault("startedAt", ts.get("createdAt") or _now_iso())
+            ts.setdefault("finishedAt", ts.get("finishedAt") or _now_iso())
+            ts.setdefault("updatedAt", ts.get("updatedAt") or _now_iso())
+            return ts
+    now = _now_iso()
+    return {
+        "id": str(uuid.uuid4()),
+        "projectId": project_id,
+        "type": "",
+        "status": TASK_STATUS_PENDING,
+        "progress": 0,
+        "message": "",
+        "parameters": {
+            "shot_defaults": {"storyText": ""},
+            "shot": {"transition": "", "image_width": 0, "image_height": 0},
+            "video": {},
+            "tts": {},
+            "depends_on": "",
+        },
+        "result": {},
+        "error": "",
+        "estimatedDuration": 0,
+        "startedAt": now,
+        "finishedAt": now,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+
+
+@app.post("/v1/api/projects")
+async def create_project(Title: Optional[str] = None, StoryText: Optional[str] = None, Style: Optional[str] = None):
+    project_id = str(uuid.uuid4())
+    now = _now_iso()
+    shot_count = 5
+    project = {
+        "id": project_id,
+        "title": Title or "",
+        "storyText": StoryText or "",
+        "style": Style or "",
+        "status": "created",
+        "coverImage": "",
+        "duration": 0,
+        "videoUrl": "",
+        "description": "",
+        "shotCount": shot_count,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    projects[project_id] = project
+    shots: Dict[str, Dict] = {}
+    for i in range(shot_count):
+        shot = _make_shot(project_id, i + 1)
+        shots[shot["id"]] = shot
+    project_shots[project_id] = shots
+    shot_task_ids = [str(uuid.uuid4()) for _ in range(shot_count)]
+    text_task_id = str(uuid.uuid4())
+    return {"project_id": project_id, "shot_task_ids": shot_task_ids, "text_task_id": text_task_id}
+
+
+@app.put("/v1/api/projects/{project_id}")
+async def update_project(project_id: str, Title: Optional[str] = None, Description: Optional[str] = None):
+    project = _get_or_404_project(project_id)
+    if Title is not None:
+        project["title"] = Title
+    if Description is not None:
+        project["description"] = Description
+    project["updatedAt"] = _now_iso()
+    projects[project_id] = project
+    return {"id": project_id, "updateAT": project["updatedAt"]}
+
+
+@app.delete("/v1/api/projects/{project_id}")
+async def delete_project(project_id: str):
+    deleted = project_id in projects
+    projects.pop(project_id, None)
+    project_shots.pop(project_id, None)
+    return {"success": deleted, "deleteAt": _now_iso(), "message": "deleted" if deleted else "not found"}
+
+
+@app.get("/v1/api/projects/{project_id}")
+async def get_project(project_id: str):
+    project = _get_or_404_project(project_id)
+    shots = list(project_shots.get(project_id, {}).values()) or None
+    recent_task = _recent_task_for_project(project_id)
+    project_detail = project.copy()
+    project_detail["shotCount"] = len(project_shots.get(project_id, {}))
+    return {
+        "project_detail": project_detail,
+        "recent_task": recent_task,
+        "shots": shots,
+    }
+
+
+@app.get("/v1/api/projects/{project_id}/shots")
+async def list_shots(project_id: str):
+    _get_or_404_project(project_id)
+    shots = list(project_shots.get(project_id, {}).values())
+    return {"project_id": project_id, "total_shots": len(shots), "shots": shots}
+
+
+@app.post("/v1/api/projects/{project_id}/shots/{shot_id}")
+async def update_shot(project_id: str, shot_id: str, title: Optional[str] = None, prompt: Optional[str] = None, transition: Optional[str] = None):
+    _get_or_404_project(project_id)
+    shots = project_shots[project_id]
+    if shot_id not in shots:
+        shots[shot_id] = _make_shot(project_id, len(shots) + 1, shot_id=shot_id)
+    shot = shots[shot_id]
+    if title is not None:
+        shot["title"] = title
+    if prompt is not None:
+        shot["prompt"] = prompt
+    if transition is not None:
+        shot["transition"] = transition
+    shot["updatedAt"] = _now_iso()
+    shots[shot_id] = shot
+    task_id = str(uuid.uuid4())
+    return {"shot_id": shot_id, "task_id": task_id, "message": "updated"}
+
+
+@app.get("/v1/api/projects/{project_id}/shots/{shot_id}")
+async def get_shot(project_id: str, shot_id: str):
+    _get_or_404_project(project_id)
+    shot = project_shots[project_id].get(shot_id)
+    if not shot:
+        raise HTTPException(status_code=404, detail="shot not found")
+    return {"shot_detail": shot}
+
+
+@app.delete("/v1/api/proejcts/{project_id}/shot/{shot_id}")
+async def delete_shot(project_id: str, shot_id: str):
+    # Note: path spelling kept as provided in spec ("proejcts")
+    shots = project_shots.get(project_id, {})
+    existed = shots.pop(shot_id, None) is not None
+    return {"message": "deleted" if existed else "not found", "shot_id": shot_id, "project_id": project_id}
+
+
+@app.post("/v1/api/projects/{project_id}/tts")
+async def project_tts(project_id: str):
+    _get_or_404_project(project_id)
+    task_id = str(uuid.uuid4())
+    return {"task_id": task_id, "message": "accepted", "project_id": project_id}
+
+
+@app.post("/v1/api/projects/{project_id}/video")
+async def project_video(project_id: str):
+    _get_or_404_project(project_id)
+    task_id = str(uuid.uuid4())
+    return {"task_id": task_id, "message": "accepted", "project_id": project_id}
 
 
 # CLI entry: uvicorn gateway.main:app --host 0.0.0.0 --port 8000
